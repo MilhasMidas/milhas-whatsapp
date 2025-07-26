@@ -1,0 +1,50 @@
+services:
+  go_app:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: go_app
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    networks:
+      - app-tier
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://docker:docker@db_go:5432/mydb
+    depends_on:
+      - dbgo
+  dbgo:
+    image: postgres:latest
+    container_name: dbgo
+    networks:
+      - app-tier
+    environment:
+      POSTGRES_USER: docker
+      POSTGRES_PASSWORD: docker
+      POSTGRES_DB: mydb
+
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: a@a.com
+      PGADMIN_DEFAULT_PASSWORD: 123456
+    ports:
+      - "5050:80"
+    networks:
+      - app-tier
+
+volumes:
+  db_data:
+    driver: local
+
+networks:
+  app-tier:
+    driver: bridge
