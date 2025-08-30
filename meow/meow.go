@@ -20,14 +20,12 @@ type MyClient struct {
 
 func (mycli *MyClient) Register() {
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
-
 }
 
 func (mycli *MyClient) myEventHandler(evt interface{}) {
-	logger.Debug("Eventos customizados recebidos:")
-	logger.Debugf("Evento recebido: %v", evt)
-	logger.Info("Id do Client:", mycli.WAClient.Store.ID)
-	PrintGroups(client)
+	//logger.Debug("Eventos customizados recebidos:")
+//	logger.Debugf("Evento recebido: %v", evt)
+	//logger.Info("Id do Client:", mycli.WAClient.Store.ID)
 
 }
 
@@ -39,13 +37,13 @@ func StartSession() {
 		log.Fatal(err)
 	}
 	client = CreateClient(deviceStore)
-
 	ShowQrCode(client)
 
 	myClient := &MyClient{WAClient: client}
 	myClient.Register()
 
 	ReceivedMessageHandler(client)
+
 	err = client.Connect()
 	if err != nil {
 		log.Fatalf("Erro ao conectar: %v", err)
