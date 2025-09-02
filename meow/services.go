@@ -431,6 +431,11 @@ type Destination struct {
 	AirportCode string `json:"airportCode"`
 }
 
+type Connection struct {
+	City        string `json:"city"`
+	AirportCode string `json:"airportCode"`
+}
+
 type Fees struct {
 	Value    float64 `json:"value"`
 	Currency string  `json:"currency"`
@@ -454,6 +459,7 @@ type FlightData struct {
 	ServiceClass    string           `json:"serviceClass"`
 	LoyaltyPrograms []LoyaltyProgram `json:"loyaltyPrograms"`
 	Availability    Availability     `json:"availability"`
+	Connections     []Connection     `json:"connections"`
 }
 
 // InitializeGeminiClient initializes the Gemini client with the API key
@@ -516,6 +522,24 @@ func SendImageToGemini(imagePath string) (*FlightData, error) {
 				},
 				Required: []string{"city", "airportCode"},
 			},
+			"connections": {
+				Type:        genai.TypeArray,
+				Description: "A list of connection points along the route.",
+				Items: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"city": {
+							Type:        genai.TypeString,
+							Description: "The city of the connection.",
+						},
+						"airportCode": {
+							Type:        genai.TypeString,
+							Description: "The IATA airport code for the connection.",
+						},
+					},
+					Required: []string{"city", "airportCode"},
+				},
+			},
 			"airline": {
 				Type:        genai.TypeString,
 				Description: "The name of the airline.",
@@ -539,8 +563,17 @@ func SendImageToGemini(imagePath string) (*FlightData, error) {
 							Description: "The number of miles or points required for the flight.",
 						},
 						"fees": {
-							Type:        genai.TypeString,
-							Description: "The taxes and fees associated with the ticket (can be a number with currency or descriptive string).",
+							Type: genai.TypeObject,
+							Properties: map[string]*genai.Schema{
+								"value": {
+									Type:        genai.TypeNumber,
+									Description: "The value of the fee.",
+								},
+								"currency": {
+									Type:        genai.TypeString,
+									Description: "The currency of the fee.",
+								},
+							},
 						},
 					},
 					Required: []string{"name", "miles", "fees"},

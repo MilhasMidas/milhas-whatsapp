@@ -49,7 +49,7 @@ func StartSession() {
 	myClient.Register()
 
 	// ReceivedMessageHandler(client)
-	StartAlertGroupProcessing(client, "AIzaSyDypAcBB6RSh4PmVaaaO-lxGXzQ5-uDpbE")
+	StartAlertGroupProcessing(client, "AIzaSyBG95oWp6P_NRU3VRrH8j2YsZzcT6Vb6GU")
 
 	err = client.Connect()
 	if err != nil {
