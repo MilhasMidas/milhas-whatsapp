@@ -479,6 +479,67 @@ func InitializeGeminiClient(apiKey string) error {
 	return nil
 }
 
+// retryGeminiCall executes a function with retry logic for Gemini API calls
+// It will retry up to maxRetries times with a delay of 30 seconds between attempts
+// It specifically handles 503 errors (model overloaded) and other retryable errors
+func retryGeminiCall(maxRetries int, operation func() error) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := operation()
+		if err == nil {
+			return nil // Success
+		}
+
+		lastErr = err
+
+		// Check if this is a retryable error
+		if !isRetryableError(err) {
+			return err // Don't retry non-retryable errors
+		}
+
+		// If this is not the last attempt, wait before retrying
+		if attempt < maxRetries {
+			logger.Warnf("Gemini API call failed (attempt %d/%d): %v. Retrying in 30 seconds...", attempt, maxRetries, err)
+			time.Sleep(30 * time.Second)
+		} else {
+			logger.Errorf("Gemini API call failed after %d attempts: %v", maxRetries, err)
+		}
+	}
+
+	return fmt.Errorf("failed after %d attempts, last error: %v", maxRetries, lastErr)
+}
+
+// isRetryableError checks if an error is retryable
+// Returns true for 503 errors (model overloaded) and other temporary errors
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Check for specific retryable error patterns
+	retryablePatterns := []string{
+		"Error 503",
+		"model is overloaded",
+		"UNAVAILABLE",
+		"RESOURCE_EXHAUSTED",
+		"RATE_LIMIT_EXCEEDED",
+		"temporarily unavailable",
+		"timeout",
+		"connection reset",
+	}
+
+	for _, pattern := range retryablePatterns {
+		if strings.Contains(strings.ToLower(errStr), strings.ToLower(pattern)) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // PreAnalyzeImageWithGemini performs a pre-analysis of an image to determine if it's a flight availability calendar
 // This function uses Gemini AI to quickly analyze an image and return a boolean indicating whether
 // the image contains a flight availability calendar. This helps filter out irrelevant images
@@ -492,56 +553,68 @@ func PreAnalyzeImageWithGemini(imagePath string) (*schemas.ImagePreAnalysisRespo
 		return nil, fmt.Errorf("gemini client not initialized, call InitializeGeminiClient first")
 	}
 
-	ctx := context.Background()
-
 	// Read image data
 	imageData, err := os.ReadFile(imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image: %v", err)
 	}
 
-	// Create the schema for structured output
-	schema := &genai.Schema{
-		Type: genai.TypeObject,
-		Properties: map[string]*genai.Schema{
-			"isCalendar": {
-				Type:        genai.TypeBoolean,
-				Description: "True if the image contains a flight availability calendar with dates and availability information, false otherwise.",
+	var preAnalysisResponse *schemas.ImagePreAnalysisResponse
+
+	// Use retry logic for the Gemini API call
+	err = retryGeminiCall(3, func() error {
+		ctx := context.Background()
+
+		// Create the schema for structured output
+		schema := &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"isCalendar": {
+					Type:        genai.TypeBoolean,
+					Description: "True if the image contains a flight availability calendar with dates and availability information, false otherwise.",
+				},
 			},
-		},
-		Required: []string{"isCalendar"},
-	}
+			Required: []string{"isCalendar"},
+		}
 
-	// Configure the generation settings
-	config := &genai.GenerateContentConfig{
-		ResponseMIMEType: "application/json",
-		ResponseSchema:   schema,
-	}
+		// Configure the generation settings
+		config := &genai.GenerateContentConfig{
+			ResponseMIMEType: "application/json",
+			ResponseSchema:   schema,
+		}
 
-	// Create content with text and image
-	textPart := genai.NewPartFromText("Analyze this image and determine if it contains a flight availability calendar. Look for elements like calendar grid with dates. Return true only if this is clearly a flight availability calendar, false for any other type of image.")
-	imagePart := genai.NewPartFromBytes(imageData, "image/jpeg")
+		// Create content with text and image
+		textPart := genai.NewPartFromText("Analyze this image and determine if it contains a flight availability calendar. Look for elements like calendar grid with dates. Return true only if this is clearly a flight availability calendar, false for any other type of image.")
+		imagePart := genai.NewPartFromBytes(imageData, "image/jpeg")
 
-	content := genai.NewContentFromParts([]*genai.Part{textPart, imagePart}, genai.RoleUser)
+		content := genai.NewContentFromParts([]*genai.Part{textPart, imagePart}, genai.RoleUser)
 
-	// Generate content
-	result, err := geminiClient.Models.GenerateContent(
-		ctx,
-		"gemini-2.5-flash",
-		[]*genai.Content{content},
-		config,
-	)
+		// Generate content
+		result, err := geminiClient.Models.GenerateContent(
+			ctx,
+			"gemini-2.5-flash",
+			[]*genai.Content{content},
+			config,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to generate content: %v", err)
+		}
+
+		// Parse the JSON response
+		var response schemas.ImagePreAnalysisResponse
+		if err := json.Unmarshal([]byte(result.Text()), &response); err != nil {
+			return fmt.Errorf("failed to unmarshal pre-analysis response: %v", err)
+		}
+
+		preAnalysisResponse = &response
+		return nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate content: %v", err)
+		return nil, err
 	}
 
-	// Parse the JSON response
-	var preAnalysisResponse schemas.ImagePreAnalysisResponse
-	if err := json.Unmarshal([]byte(result.Text()), &preAnalysisResponse); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal pre-analysis response: %v", err)
-	}
-
-	return &preAnalysisResponse, nil
+	return preAnalysisResponse, nil
 }
 
 // AnalyzeImageWithPreCheck performs both pre-analysis and full processing if the image is a calendar
@@ -579,154 +652,166 @@ func SendImageToGemini(imagePath string) (*FlightData, error) {
 		return nil, fmt.Errorf("gemini client not initialized, call InitializeGeminiClient first")
 	}
 
-	ctx := context.Background()
-
 	// Read image data
 	imageData, err := os.ReadFile(imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read image: %v", err)
 	}
 
-	// Create the schema for structured output
-	schema := &genai.Schema{
-		Type: genai.TypeObject,
-		Properties: map[string]*genai.Schema{
-			"origin": {
-				Type: genai.TypeObject,
-				Properties: map[string]*genai.Schema{
-					"city": {
-						Type:        genai.TypeString,
-						Description: "The departure city.",
-					},
-					"airportCode": {
-						Type:        genai.TypeString,
-						Description: "The IATA airport code for the origin.",
-					},
-				},
-				Required: []string{"city", "airportCode"},
-			},
-			"destination": {
-				Type: genai.TypeObject,
-				Properties: map[string]*genai.Schema{
-					"city": {
-						Type:        genai.TypeString,
-						Description: "The arrival city.",
-					},
-					"airportCode": {
-						Type:        genai.TypeString,
-						Description: "The IATA airport code for the destination.",
-					},
-				},
-				Required: []string{"city", "airportCode"},
-			},
-			"connections": {
-				Type:        genai.TypeArray,
-				Description: "A list of connection points along the route.",
-				Items: &genai.Schema{
+	var flightData *FlightData
+
+	// Use retry logic for the Gemini API call
+	err = retryGeminiCall(3, func() error {
+		ctx := context.Background()
+
+		// Create the schema for structured output
+		schema := &genai.Schema{
+			Type: genai.TypeObject,
+			Properties: map[string]*genai.Schema{
+				"origin": {
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
 						"city": {
 							Type:        genai.TypeString,
-							Description: "The city of the connection.",
+							Description: "The departure city.",
 						},
 						"airportCode": {
 							Type:        genai.TypeString,
-							Description: "The IATA airport code for the connection.",
+							Description: "The IATA airport code for the origin.",
 						},
 					},
 					Required: []string{"city", "airportCode"},
 				},
-			},
-			"airline": {
-				Type:        genai.TypeString,
-				Description: "The name of the airline.",
-			},
-			"serviceClass": {
-				Type:        genai.TypeString,
-				Description: "The class of service (e.g., 'Executive', 'Economy').",
-			},
-			"loyaltyPrograms": {
-				Type:        genai.TypeArray,
-				Description: "A list of loyalty programs and their associated costs.",
-				Items: &genai.Schema{
+				"destination": {
 					Type: genai.TypeObject,
 					Properties: map[string]*genai.Schema{
-						"name": {
+						"city": {
 							Type:        genai.TypeString,
-							Description: "The name of the loyalty program (e.g., 'Aeroplan').",
+							Description: "The arrival city.",
 						},
-						"miles": {
-							Type:        genai.TypeNumber,
-							Description: "The number of miles or points required for the flight.",
+						"airportCode": {
+							Type:        genai.TypeString,
+							Description: "The IATA airport code for the destination.",
 						},
-						"fees": {
-							Type: genai.TypeObject,
-							Properties: map[string]*genai.Schema{
-								"value": {
-									Type:        genai.TypeNumber,
-									Description: "The value of the fee.",
-								},
-								"currency": {
-									Type:        genai.TypeString,
-									Description: "The currency of the fee.",
+					},
+					Required: []string{"city", "airportCode"},
+				},
+				"connections": {
+					Type:        genai.TypeArray,
+					Description: "A list of connection points along the route.",
+					Items: &genai.Schema{
+						Type: genai.TypeObject,
+						Properties: map[string]*genai.Schema{
+							"city": {
+								Type:        genai.TypeString,
+								Description: "The city of the connection.",
+							},
+							"airportCode": {
+								Type:        genai.TypeString,
+								Description: "The IATA airport code for the connection.",
+							},
+						},
+						Required: []string{"city", "airportCode"},
+					},
+				},
+				"airline": {
+					Type:        genai.TypeString,
+					Description: "The name of the airline.",
+				},
+				"serviceClass": {
+					Type:        genai.TypeString,
+					Description: "The class of service (e.g., 'Executive', 'Economy').",
+				},
+				"loyaltyPrograms": {
+					Type:        genai.TypeArray,
+					Description: "A list of loyalty programs and their associated costs.",
+					Items: &genai.Schema{
+						Type: genai.TypeObject,
+						Properties: map[string]*genai.Schema{
+							"name": {
+								Type:        genai.TypeString,
+								Description: "The name of the loyalty program (e.g., 'Aeroplan').",
+							},
+							"miles": {
+								Type:        genai.TypeNumber,
+								Description: "The number of miles or points required for the flight.",
+							},
+							"fees": {
+								Type: genai.TypeObject,
+								Properties: map[string]*genai.Schema{
+									"value": {
+										Type:        genai.TypeNumber,
+										Description: "The value of the fee.",
+									},
+									"currency": {
+										Type:        genai.TypeString,
+										Description: "The currency of the fee.",
+									},
 								},
 							},
 						},
+						Required: []string{"name", "miles", "fees"},
 					},
-					Required: []string{"name", "miles", "fees"},
 				},
-			},
-			"availability": {
-				Type: genai.TypeObject,
-				Properties: map[string]*genai.Schema{
-					"searchDate": {
-						Type:        genai.TypeString,
-						Description: "The date the search was performed.",
-					},
-					"availableDates": {
-						Type:        genai.TypeArray,
-						Description: "A list of available dates for the flight in YYYY-MM-DD format.",
-						Items: &genai.Schema{
-							Type: genai.TypeString,
+				"availability": {
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"searchDate": {
+							Type:        genai.TypeString,
+							Description: "The date the search was performed.",
+						},
+						"availableDates": {
+							Type:        genai.TypeArray,
+							Description: "A list of available dates for the flight in YYYY-MM-DD format.",
+							Items: &genai.Schema{
+								Type: genai.TypeString,
+							},
 						},
 					},
+					Required: []string{"searchDate", "availableDates"},
 				},
-				Required: []string{"searchDate", "availableDates"},
 			},
-		},
-		Required: []string{"origin", "destination", "airline", "serviceClass", "loyaltyPrograms", "availability"},
-	}
+			Required: []string{"origin", "destination", "airline", "serviceClass", "loyaltyPrograms", "availability"},
+		}
 
-	// Configure the generation settings
-	config := &genai.GenerateContentConfig{
-		ResponseMIMEType: "application/json",
-		ResponseSchema:   schema,
-	}
+		// Configure the generation settings
+		config := &genai.GenerateContentConfig{
+			ResponseMIMEType: "application/json",
+			ResponseSchema:   schema,
+		}
 
-	// Create content with text and image
-	textPart := genai.NewPartFromText("Analyze this flight booking image and extract the flight information. Return the data in the exact JSON schema provided.")
-	imagePart := genai.NewPartFromBytes(imageData, "image/jpeg")
+		// Create content with text and image
+		textPart := genai.NewPartFromText("Analyze this flight booking image and extract the flight information. Return the data in the exact JSON schema provided.")
+		imagePart := genai.NewPartFromBytes(imageData, "image/jpeg")
 
-	content := genai.NewContentFromParts([]*genai.Part{textPart, imagePart}, genai.RoleUser)
+		content := genai.NewContentFromParts([]*genai.Part{textPart, imagePart}, genai.RoleUser)
 
-	// Generate content
-	result, err := geminiClient.Models.GenerateContent(
-		ctx,
-		"gemini-2.5-flash",
-		[]*genai.Content{content},
-		config,
-	)
+		// Generate content
+		result, err := geminiClient.Models.GenerateContent(
+			ctx,
+			"gemini-2.5-flash",
+			[]*genai.Content{content},
+			config,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to generate content: %v", err)
+		}
+
+		// Parse the JSON response
+		var data FlightData
+		if err := json.Unmarshal([]byte(result.Text()), &data); err != nil {
+			return fmt.Errorf("failed to unmarshal flight data: %v", err)
+		}
+
+		flightData = &data
+		return nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate content: %v", err)
+		return nil, err
 	}
 
-	// Parse the JSON response
-	var flightData FlightData
-	if err := json.Unmarshal([]byte(result.Text()), &flightData); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal flight data: %v", err)
-	}
-
-	return &flightData, nil
+	return flightData, nil
 }
 
 // ProcessAlertGroupImages processes images from the "Alert" group and sends them to Gemini
@@ -741,7 +826,7 @@ func ProcessAlertGroupImages(client *whatsmeow.Client) error {
 			setOfflineSyncCompleted()
 
 			// Now that sync is completed, find the Alert group
-			alertGroup, alertGroupErr = FindGroupByName(client, "Alert")
+			alertGroup, alertGroupErr = FindGroupByName(client, "PP • Mundo Ultra (MU02)")
 			if alertGroupErr != nil {
 				logger.Errorf("failed to find Alert group after sync: %v", alertGroupErr)
 				return
