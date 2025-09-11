@@ -15,14 +15,17 @@ import (
 	"time"
 
 	"github.com/Unicorn-s-Club/whats-unicorn/config"
+	schemas "github.com/Unicorn-s-Club/whats-unicorn/schemas"
 	"github.com/mdp/qrterminal/v3"
 	"google.golang.org/genai"
 
+	"github.com/google/uuid"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"gorm.io/gorm"
 )
 
 func GetDevice() (*store.Device, error) {
@@ -588,7 +591,7 @@ func SendImageToGemini(imagePath string) (*FlightData, error) {
 					},
 					"availableDates": {
 						Type:        genai.TypeArray,
-						Description: "A list of available dates for the flight in DD/MM/YYYY format.",
+						Description: "A list of available dates for the flight in YYYY-MM-DD format.",
 						Items: &genai.Schema{
 							Type: genai.TypeString,
 						},
@@ -691,6 +694,14 @@ func ProcessAlertGroupImages(client *whatsmeow.Client) error {
 			flightDataJSON, _ := json.MarshalIndent(flightData, "", "  ")
 			fmt.Printf("%s\n", string(flightDataJSON))
 
+			// Convert FlightData to GeminiResponse and save to database
+			geminiResponse := convertFlightDataToGeminiResponse(flightData)
+			if err := saveGeminiResponseToDatabase(geminiResponse); err != nil {
+				fmt.Printf("[ERROR] Failed to save flight data to database: %v\n", err)
+			} else {
+				fmt.Printf("[SUCCESS] Flight data saved to database successfully\n")
+			}
+
 			// Clean up the image file
 			if err := os.Remove(imagePath); err != nil {
 				fmt.Printf("[WARN] Failed to remove image file %s: %v\n", imagePath, err)
@@ -739,4 +750,353 @@ func StartAlertGroupProcessing(client *whatsmeow.Client, geminiAPIKey string) er
 	}
 
 	return ProcessAlertGroupImages(client)
+}
+
+// convertFlightDataToGeminiResponse converts FlightData to GeminiResponse schema
+func convertFlightDataToGeminiResponse(flightData *FlightData) *schemas.GeminiResponse {
+	// Convert loyalty programs
+	var loyaltyPrograms []schemas.GeminiLoyaltyProgram
+	for _, lp := range flightData.LoyaltyPrograms {
+		geminiLP := schemas.GeminiLoyaltyProgram{
+			Name:  lp.Name,
+			Miles: lp.Miles,
+			Fees:  lp.Fees, // Keep as interface{} to handle both struct and string
+		}
+		loyaltyPrograms = append(loyaltyPrograms, geminiLP)
+	}
+
+	// Convert connections
+	var connections []schemas.GeminiConnection
+	for _, conn := range flightData.Connections {
+		geminiConn := schemas.GeminiConnection{
+			City:        conn.City,
+			AirportCode: conn.AirportCode,
+		}
+		connections = append(connections, geminiConn)
+	}
+
+	return &schemas.GeminiResponse{
+		Origin: schemas.GeminiOrigin{
+			City:        flightData.Origin.City,
+			AirportCode: flightData.Origin.AirportCode,
+		},
+		Destination: schemas.GeminiDestination{
+			City:        flightData.Destination.City,
+			AirportCode: flightData.Destination.AirportCode,
+		},
+		Airline:         flightData.Airline,
+		ServiceClass:    flightData.ServiceClass,
+		LoyaltyPrograms: loyaltyPrograms,
+		Availability: schemas.GeminiAvailability{
+			SearchDate:     flightData.Availability.SearchDate,
+			AvailableDates: flightData.Availability.AvailableDates,
+		},
+		Connections: connections,
+	}
+}
+
+// saveGeminiResponseToDatabase saves the Gemini response to the database
+func saveGeminiResponseToDatabase(geminiResponse *schemas.GeminiResponse) error {
+	// Get database instance
+	db := config.GetPostgres()
+	if db == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	// Create service instance directly to avoid import cycle
+	service := &FlightAwardService{db: db}
+
+	// Save the response
+	_, err := service.SaveGeminiResponse(geminiResponse)
+	if err != nil {
+		return fmt.Errorf("failed to save Gemini response: %v", err)
+	}
+
+	return nil
+}
+
+// FlightAwardService represents the service for managing flight awards
+type FlightAwardService struct {
+	db *gorm.DB
+}
+
+// NewFlightAwardService creates a new FlightAwardService instance
+func NewFlightAwardService(db *gorm.DB) *FlightAwardService {
+	return &FlightAwardService{db: db}
+}
+
+// SaveGeminiResponse converts and saves a GeminiResponse to the database
+func (s *FlightAwardService) SaveGeminiResponse(geminiResp *schemas.GeminiResponse) (*schemas.FlightAward, error) {
+	// Start a transaction
+	tx := s.db.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// Create or get origin airport
+	originAirport, err := s.createOrGetAirport(tx, geminiResp.Origin.City, geminiResp.Origin.AirportCode)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error creating/getting origin airport: %v", err)
+	}
+
+	// Create or get destination airport
+	destAirport, err := s.createOrGetAirport(tx, geminiResp.Destination.City, geminiResp.Destination.AirportCode)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error creating/getting destination airport: %v", err)
+	}
+
+	// Create or get airline
+	airline, err := s.createOrGetAirline(tx, geminiResp.Airline)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error creating/getting airline: %v", err)
+	}
+
+	// Parse search date
+	searchDate, err := time.Parse("2006-01-02", geminiResp.Availability.SearchDate)
+	if err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error parsing search date: %v", err)
+	}
+
+	// Convert service class
+	serviceClassCode := s.convertServiceClass(geminiResp.ServiceClass)
+
+	// Create FlightAward
+	flightAward := &schemas.FlightAward{
+		ID:                     uuid.New(),
+		OriginAirportCode:      originAirport.AirportCode,
+		DestinationAirportCode: destAirport.AirportCode,
+		AirlineID:              airline.ID,
+		ServiceClassCode:       serviceClassCode,
+		ServiceClassRaw:        geminiResp.ServiceClass,
+		SearchDate:             searchDate,
+		CreatedAt:              time.Now(),
+		UpdatedAt:              time.Now(),
+	}
+
+	// Save FlightAward
+	if err := tx.Create(flightAward).Error; err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error creating flight award: %v", err)
+	}
+
+	// Save available dates
+	if err := s.saveAvailableDates(tx, flightAward.ID, geminiResp.Availability.AvailableDates); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error saving available dates: %v", err)
+	}
+
+	// Save loyalty programs and costs
+	if err := s.saveLoyaltyPrograms(tx, flightAward.ID, geminiResp.LoyaltyPrograms); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error saving loyalty programs: %v", err)
+	}
+
+	// Save connections
+	if err := s.saveConnections(tx, flightAward.ID, geminiResp.Connections); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("error saving connections: %v", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit().Error; err != nil {
+		return nil, fmt.Errorf("error committing transaction: %v", err)
+	}
+
+	return flightAward, nil
+}
+
+// createOrGetAirport creates a new airport or returns existing one
+func (s *FlightAwardService) createOrGetAirport(tx *gorm.DB, city, airportCode string) (*schemas.Airport, error) {
+	var airport schemas.Airport
+
+	// Try to find existing airport
+	if err := tx.Where("airport_code = ?", airportCode).First(&airport).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Create new airport
+			airport = schemas.Airport{
+				AirportCode: airportCode,
+				City:        city,
+			}
+			if err := tx.Create(&airport).Error; err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	return &airport, nil
+}
+
+// createOrGetAirline creates a new airline or returns existing one
+func (s *FlightAwardService) createOrGetAirline(tx *gorm.DB, airlineName string) (*schemas.Airline, error) {
+	var airline schemas.Airline
+
+	// Try to find existing airline
+	if err := tx.Where("name = ?", airlineName).First(&airline).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Create new airline
+			airline = schemas.Airline{
+				ID:   uuid.New(),
+				Name: airlineName,
+			}
+			if err := tx.Create(&airline).Error; err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	return &airline, nil
+}
+
+// createOrGetLoyaltyProgram creates a new loyalty program or returns existing one
+func (s *FlightAwardService) createOrGetLoyaltyProgram(tx *gorm.DB, programName string) (*schemas.LoyaltyProgram, error) {
+	var program schemas.LoyaltyProgram
+
+	// Try to find existing program
+	if err := tx.Where("name = ?", programName).First(&program).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			// Create new program
+			program = schemas.LoyaltyProgram{
+				ID:   uuid.New(),
+				Name: programName,
+			}
+			if err := tx.Create(&program).Error; err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	return &program, nil
+}
+
+// convertServiceClass converts string service class to ServiceClassCode
+func (s *FlightAwardService) convertServiceClass(serviceClass string) schemas.ServiceClassCode {
+	serviceClass = strings.ToUpper(strings.TrimSpace(serviceClass))
+
+	switch serviceClass {
+	case "ECONOMY", "ECONÔMICA":
+		return schemas.ServiceClassEconomy
+	case "PREMIUM ECONOMY", "ECONOMIA PREMIUM", "PREMIUM_ECONOMY":
+		return schemas.ServiceClassPremiumEconomy
+	case "BUSINESS", "EXECUTIVA":
+		return schemas.ServiceClassBusiness
+	case "FIRST", "PRIMEIRA":
+		return schemas.ServiceClassFirst
+	default:
+		return schemas.ServiceClassOther
+	}
+}
+
+// saveAvailableDates saves available dates for a flight award
+func (s *FlightAwardService) saveAvailableDates(tx *gorm.DB, flightAwardID uuid.UUID, availableDates []string) error {
+	for _, dateStr := range availableDates {
+		date, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			// Skip invalid dates
+			continue
+		}
+
+		availableDate := schemas.FlightAwardAvailableDate{
+			FlightAwardID: flightAwardID,
+			AvailableDate: date,
+		}
+
+		// Use FirstOrCreate to avoid duplicates
+		if err := tx.Where("flight_award_id = ? AND available_date = ?", flightAwardID, date).
+			FirstOrCreate(&availableDate).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// saveLoyaltyPrograms saves loyalty programs and their costs
+func (s *FlightAwardService) saveLoyaltyPrograms(tx *gorm.DB, flightAwardID uuid.UUID, programs []schemas.GeminiLoyaltyProgram) error {
+	for _, program := range programs {
+		// Create or get loyalty program
+		loyaltyProgram, err := s.createOrGetLoyaltyProgram(tx, program.Name)
+		if err != nil {
+			return err
+		}
+
+		// Parse fees
+		var feeValue *float64
+		var feeCurrency *string
+		var feeText *string
+
+		if program.Fees != nil {
+			switch fees := program.Fees.(type) {
+			case schemas.GeminiFees:
+				feeValue = &fees.Value
+				feeCurrency = &fees.Currency
+			case string:
+				feeText = &fees
+			case map[string]interface{}:
+				if value, ok := fees["value"].(float64); ok {
+					feeValue = &value
+				}
+				if currency, ok := fees["currency"].(string); ok {
+					feeCurrency = &currency
+				}
+			}
+		}
+
+		// Create program cost
+		programCost := schemas.FlightAwardProgramCost{
+			ID:               uuid.New(),
+			FlightAwardID:    flightAwardID,
+			LoyaltyProgramID: loyaltyProgram.ID,
+			Miles:            int(program.Miles),
+			FeeValue:         feeValue,
+			FeeCurrency:      feeCurrency,
+			FeeText:          feeText,
+		}
+
+		// Use FirstOrCreate to avoid duplicates
+		if err := tx.Where("flight_award_id = ? AND loyalty_program_id = ?", flightAwardID, loyaltyProgram.ID).
+			FirstOrCreate(&programCost).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// saveConnections saves flight connections
+func (s *FlightAwardService) saveConnections(tx *gorm.DB, flightAwardID uuid.UUID, connections []schemas.GeminiConnection) error {
+	for seq, connection := range connections {
+		// Create or get connection airport
+		airport, err := s.createOrGetAirport(tx, connection.City, connection.AirportCode)
+		if err != nil {
+			return err
+		}
+
+		flightConnection := schemas.FlightConnection{
+			FlightAwardID: flightAwardID,
+			AirportID:     airport.AirportCode,
+			SEQ:           uint16(seq + 1), // SEQ starts from 1
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+
+		// Use FirstOrCreate to avoid duplicates
+		if err := tx.Where("flight_award_id = ? AND seq = ?", flightAwardID, flightConnection.SEQ).
+			FirstOrCreate(&flightConnection).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

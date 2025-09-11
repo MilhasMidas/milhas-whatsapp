@@ -30,6 +30,12 @@ func initializeRoutes(router *gin.Engine) {
 
 		//whatsMeow
 		api.POST("/send", handler.SendMessageHandler)
+
+		// Flight Award endpoints
+		api.POST("/flight-award/process-gemini", handler.ProcessGeminiResponse)
+		api.GET("/flight-award/:id", handler.GetFlightAwardByID)
+		api.GET("/flight-award/route", handler.GetFlightAwardsByRoute)
+
 		api.GET("/", func(c *gin.Context) {
 			c.JSON(200, gin.H{"message": "Hello, world!"})
 		})
