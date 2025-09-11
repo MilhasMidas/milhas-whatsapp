@@ -69,3 +69,9 @@ type GeminiProcessingResponse struct {
 	Error     string          `json:"error,omitempty"`
 	Processed bool            `json:"processed"`
 }
+
+// ImagePreAnalysisResponse represents the response from pre-analyzing an image
+// to determine if it's a flight availability calendar
+type ImagePreAnalysisResponse struct {
+	IsCalendar bool `json:"isCalendar"`
+}

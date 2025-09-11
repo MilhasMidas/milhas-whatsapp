@@ -479,6 +479,100 @@ func InitializeGeminiClient(apiKey string) error {
 	return nil
 }
 
+// PreAnalyzeImageWithGemini performs a pre-analysis of an image to determine if it's a flight availability calendar
+// This function uses Gemini AI to quickly analyze an image and return a boolean indicating whether
+// the image contains a flight availability calendar. This helps filter out irrelevant images
+// before performing the more expensive full data extraction process.
+//
+// Returns:
+// - ImagePreAnalysisResponse with IsCalendar boolean field
+// - Error if the analysis fails
+func PreAnalyzeImageWithGemini(imagePath string) (*schemas.ImagePreAnalysisResponse, error) {
+	if geminiClient == nil {
+		return nil, fmt.Errorf("gemini client not initialized, call InitializeGeminiClient first")
+	}
+
+	ctx := context.Background()
+
+	// Read image data
+	imageData, err := os.ReadFile(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read image: %v", err)
+	}
+
+	// Create the schema for structured output
+	schema := &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"isCalendar": {
+				Type:        genai.TypeBoolean,
+				Description: "True if the image contains a flight availability calendar with dates and availability information, false otherwise.",
+			},
+		},
+		Required: []string{"isCalendar"},
+	}
+
+	// Configure the generation settings
+	config := &genai.GenerateContentConfig{
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   schema,
+	}
+
+	// Create content with text and image
+	textPart := genai.NewPartFromText("Analyze this image and determine if it contains a flight availability calendar. Look for elements like calendar grid with dates. Return true only if this is clearly a flight availability calendar, false for any other type of image.")
+	imagePart := genai.NewPartFromBytes(imageData, "image/jpeg")
+
+	content := genai.NewContentFromParts([]*genai.Part{textPart, imagePart}, genai.RoleUser)
+
+	// Generate content
+	result, err := geminiClient.Models.GenerateContent(
+		ctx,
+		"gemini-2.5-flash",
+		[]*genai.Content{content},
+		config,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate content: %v", err)
+	}
+
+	// Parse the JSON response
+	var preAnalysisResponse schemas.ImagePreAnalysisResponse
+	if err := json.Unmarshal([]byte(result.Text()), &preAnalysisResponse); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal pre-analysis response: %v", err)
+	}
+
+	return &preAnalysisResponse, nil
+}
+
+// AnalyzeImageWithPreCheck performs both pre-analysis and full processing if the image is a calendar
+// This is a convenience function that combines PreAnalyzeImageWithGemini and SendImageToGemini
+// in a single call. It will only proceed with full data extraction if the pre-analysis
+// confirms the image is a flight availability calendar.
+//
+// Returns:
+// - FlightData if the image is a calendar and processing succeeds
+// - Error if pre-analysis fails, image is not a calendar, or full processing fails
+func AnalyzeImageWithPreCheck(imagePath string) (*FlightData, error) {
+	// First, perform pre-analysis
+	preAnalysis, err := PreAnalyzeImageWithGemini(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("pre-analysis failed: %v", err)
+	}
+
+	// If it's not a calendar, return an error indicating it should be skipped
+	if !preAnalysis.IsCalendar {
+		return nil, fmt.Errorf("image is not a flight availability calendar")
+	}
+
+	// If it is a calendar, proceed with full analysis
+	flightData, err := SendImageToGemini(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("full analysis failed: %v", err)
+	}
+
+	return flightData, nil
+}
+
 // SendImageToGemini sends an image to Gemini API and returns structured flight data
 func SendImageToGemini(imagePath string) (*FlightData, error) {
 	if geminiClient == nil {
@@ -680,7 +774,26 @@ func ProcessAlertGroupImages(client *whatsmeow.Client) error {
 				return
 			}
 
-			// Process image with Gemini
+			// Pre-analyze image to check if it's a flight availability calendar
+			preAnalysis, err := PreAnalyzeImageWithGemini(imagePath)
+			if err != nil {
+				fmt.Printf("[ERROR] Failed to pre-analyze image with Gemini: %v\n", err)
+				// Clean up the image file
+				os.Remove(imagePath)
+				return
+			}
+
+			// Check if the image is a flight availability calendar
+			if !preAnalysis.IsCalendar {
+				fmt.Printf("[INFO] Image is not a flight availability calendar, skipping processing\n")
+				// Clean up the image file
+				os.Remove(imagePath)
+				return
+			}
+
+			fmt.Printf("[DEBUG] Image confirmed as flight availability calendar, proceeding with data extraction\n")
+
+			// Process image with Gemini for full data extraction
 			flightData, err := SendImageToGemini(imagePath)
 			if err != nil {
 				fmt.Printf("[ERROR] Failed to process image with Gemini: %v\n", err)
