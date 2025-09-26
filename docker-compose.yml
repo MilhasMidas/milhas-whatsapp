@@ -26,9 +26,9 @@ services:
       POSTGRES_USER: docker
       POSTGRES_PASSWORD: docker
       POSTGRES_DB: mydb
-
     volumes:
       - db_data:/var/lib/postgresql/data
+      - ./postgres/backups:/backups
 
   pgadmin:
     image: dpage/pgadmin4:latest

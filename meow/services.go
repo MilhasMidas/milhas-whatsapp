@@ -38,13 +38,13 @@ func GetDevice() (*store.Device, error) {
 	logger.Debugf("JID: %s", JID)
 
 	// Try to get device by JID first
-	deviceStore, err := container.GetDevice(JID)
+	deviceStore, err := container.GetDevice(context.Background(), JID)
 	if err == nil && deviceStore != nil {
 		return deviceStore, nil
 	}
 
 	// If not found by JID, try to get the first available device
-	deviceStore, err = container.GetFirstDevice()
+	deviceStore, err = container.GetFirstDevice(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("device not found: %v", err)
 	}
@@ -289,7 +289,7 @@ func sendToN8N(url string, messages []string) error {
 }
 
 func downloadImage(client *whatsmeow.Client, msgEvt *events.Message) (string, error) {
-	data, err := client.Download(msgEvt.Message.ImageMessage)
+	data, err := client.Download(context.Background(), msgEvt.Message.ImageMessage)
 	if err != nil {
 		return "", err
 	}
@@ -369,7 +369,7 @@ func SendMessageHandler(client *whatsmeow.Client, sender types.JID, message stri
 
 func GetAllDevices() ([]*store.Device, error) {
 	container := config.GetSQLiteMeow()
-	devices, err := container.GetAllDevices()
+	devices, err := container.GetAllDevices(context.Background())
 	logger.Debugf("devices: %v", devices)
 	if err != nil {
 		logger.Errorf("failed to get devices: %v", err)
@@ -385,7 +385,7 @@ func PrintGroups(client *whatsmeow.Client) {
 		return
 	}
 
-	groups, err := client.GetJoinedGroups()
+	groups, err := client.GetJoinedGroups(context.Background())
 	if err != nil {
 		logger.Errorf("failed to get joined groups: %v", err)
 		return
@@ -405,7 +405,7 @@ func FindGroupByName(client *whatsmeow.Client, groupName string) (*types.GroupIn
 		return nil, fmt.Errorf("cannot find group '%s': offline sync has not completed yet, groups are not loaded", groupName)
 	}
 
-	groups, err := client.GetJoinedGroups()
+	groups, err := client.GetJoinedGroups(context.Background())
 	logger.Debugf("groups: %v", groups)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get joined groups: %v", err)
@@ -818,6 +818,8 @@ func SendImageToGemini(imagePath string) (*FlightData, error) {
 func ProcessAlertGroupImages(client *whatsmeow.Client) error {
 	var alertGroup *types.GroupInfo
 	var alertGroupErr error
+	var group1 *types.GroupInfo
+	var group1Err error
 
 	// Set up event handler for the Alert group
 	client.AddEventHandler(func(evt interface{}) {
@@ -826,22 +828,24 @@ func ProcessAlertGroupImages(client *whatsmeow.Client) error {
 			setOfflineSyncCompleted()
 
 			// Now that sync is completed, find the Alert group
-			alertGroup, alertGroupErr = FindGroupByName(client, "PP • Mundo Ultra (MU02)")
-			if alertGroupErr != nil {
+			group1, group1Err = FindGroupByName(client, "Mundo Ultra #983")
+			alertGroup, alertGroupErr = FindGroupByName(client, "alert")
+			if alertGroupErr != nil || group1Err != nil {
 				logger.Errorf("failed to find Alert group after sync: %v", alertGroupErr)
 				return
 			}
 			logger.Debugf("alertGroup found after sync: %v", alertGroup)
+			logger.Debugf("group1 found after sync: %v", group1)
 			fmt.Printf("[DEBUG] Found Alert group: %s (ID: %s)\n", alertGroup.Name, alertGroup.JID.String())
 		}
 		if msgEvt, ok := evt.(*events.Message); ok {
 			// Only process messages if we have the alert group and sync is completed
-			if alertGroup == nil || !isOfflineSyncCompleted() {
+			if alertGroup == nil || group1 == nil || !isOfflineSyncCompleted() {
 				return
 			}
 
 			// Check if message is from Alert group
-			if !msgEvt.Info.IsGroup || msgEvt.Info.Chat.String() != alertGroup.JID.String() {
+			if !msgEvt.Info.IsGroup || msgEvt.Info.Chat.String() != alertGroup.JID.String() || msgEvt.Info.Chat.String() != group1.JID.String() {
 				return
 			}
 

@@ -15,8 +15,10 @@ var (
 
 func Init() []error {
 	var err []error = make([]error, 2)
-
+	logger.Infof("Initializing Config")
+	logger.Infof("Initializing Sql")
 	err[0] = InitSql()
+	logger.Infof("Initializing DbMeow")
 	err[1] = InitDbMeow()
 
 	logger.Debugf("Config initialized: %v", err[0])

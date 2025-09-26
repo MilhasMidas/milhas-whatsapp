@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"log"
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -9,7 +10,7 @@ import (
 
 func InitializeSQLiteMeow() (*sqlstore.Container, error) {
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
-	container, err := sqlstore.New("sqlite3", "file:./db/whatsmeow.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:./db/whatsmeow.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		// Use a temporary logger if the global logger is not initialized yet
 		if logger != nil {

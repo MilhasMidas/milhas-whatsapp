@@ -18,8 +18,9 @@ func main() {
 		logger.Errorf("config initialization error: %v", err)
 		return
 	}
-
+	logger.Infof("Config initialized")
 	meow.StartSession()
-
+	logger.Infof("Meow initialized")
 	router.Initialize()
+	logger.Infof("Router initialized")
 }
